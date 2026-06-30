@@ -90,7 +90,12 @@ const I18N = {
     objectSavedFmc: "Objekt uložen do FMC a lokální cache.",
     objectSavedLocal: "Objekt uložen lokálně.",
     overrideSaved: "Override uložen.",
-    overrideDeleted: "Override smazan.",
+    overrideSavedFmc: "Override uložen do FMC.",
+    overrideSavedLocal: "Override uložen lokálně.",
+    deleteOverrideValue: "Smazat override hodnotu",
+    confirmDeleteOverrideValue: "Smazat override hodnotu pro tento target FW?",
+    overrideDeleted: "Override hodnota smazána z lokální evidence.",
+    overrideDeletedFmc: "Override hodnota smazána z FMC i lokální evidence.",
     syncDone: "Sync hotový",
     refreshDone: "Objekt a override tabulka načteny z FMC.",
     importCsvFile: "Import CSV souboru",
@@ -177,7 +182,12 @@ const I18N = {
     objectSavedFmc: "Object saved to FMC and local cache.",
     objectSavedLocal: "Object saved locally.",
     overrideSaved: "Override saved.",
-    overrideDeleted: "Override deleted.",
+    overrideSavedFmc: "Override saved to FMC.",
+    overrideSavedLocal: "Override saved locally.",
+    deleteOverrideValue: "Delete override value",
+    confirmDeleteOverrideValue: "Delete the override value for this target FW?",
+    overrideDeleted: "Override value deleted from local records.",
+    overrideDeletedFmc: "Override value deleted from FMC and local records.",
     syncDone: "Sync finished",
     refreshDone: "Object and override table refreshed from FMC.",
     importCsvFile: "Import CSV file",
@@ -680,7 +690,7 @@ async function renderObjectOverrides(objectId) {
               <td>${escapeHtml(item.last_seen_at || "-")}</td>
               <td class="actions">
                 ${can("operator") ? `<button onclick="openOverrideModal(${objectId}, ${item.id})">${t("edit")}</button>` : ""}
-                ${can("operator") ? `<button class="danger" onclick="deleteOverride(${item.id})">${t("delete")}</button>` : ""}
+                ${can("operator") ? `<button class="danger" onclick="deleteOverride(${item.id})">${t("deleteOverrideValue")}</button>` : ""}
               </td>
             </tr>
           `).join("") || `<tr><td colspan="7"><div class="empty">${t("noOverrides")}</div></td></tr>`}
@@ -1344,13 +1354,15 @@ function prepareObjectPayload(form, body) {
 async function deleteObject(id) {
   const object = (state.cache.objects || []).find((item) => item.id === id);
   const name = object?.name || `#${id}`;
-  const target = object?.fmc_id ? (state.lang === "en" ? "local cache and the FMC object" : "lokální cache i objekt ve FMC") : (state.lang === "en" ? "local object" : "lokální objekt");
+  const target = object?.source === "missing_in_fmc"
+    ? (state.lang === "en" ? "local cache record for an object missing in FMC" : "lokální záznam objektu, který ve FMC chybí")
+    : (object?.fmc_id ? (state.lang === "en" ? "local cache and the FMC object" : "lokální cache i objekt ve FMC") : (state.lang === "en" ? "local object" : "lokální objekt"));
   if (!confirm(`${t("delete")} ${target} "${name}"? ${state.lang === "en" ? "This action also deletes local override records." : "Tato akce smaže i jeho lokální override záznamy."}`)) return;
   try {
     const result = await api(`/api/objects/${id}`, { method: "DELETE" });
     if (state.selectedObjectId === id) state.selectedObjectId = null;
     await renderObjects();
-    notify(result?.fmc_write?.ok ? (state.lang === "en" ? "Object deleted from FMC and local cache." : "Objekt smazán z FMC i lokální cache.") : (state.lang === "en" ? "Local object deleted." : "Lokální objekt smazán."));
+    notify(result?.fmc_write?.message || (result?.fmc_write?.ok ? (state.lang === "en" ? "Object deleted from FMC and local cache." : "Objekt smazán z FMC i lokální cache.") : (state.lang === "en" ? "Local object deleted." : "Lokální objekt smazán.")));
   } catch (error) {
     notify(error.message, "error");
   }
@@ -1370,13 +1382,12 @@ async function openOverrideModal(objectId, overrideId = null) {
   const selectedDeviceId = existing?.device_id || "";
   const deviceOptions = devices.map((device) => {
     const label = `${device.name}${device.model ? ` · ${device.model}` : ""}`;
-    return `<option value="${escapeHtml(device.id)}" data-name="${escapeHtml(device.name)}" ${selectedDeviceId === device.id ? "selected" : ""}>${escapeHtml(label)}</option>`;
+    return `<option value="${escapeHtml(device.id)}" data-name="${escapeHtml(device.name)}" data-type="${escapeHtml(device.type || "Device")}" ${selectedDeviceId === device.id ? "selected" : ""}>${escapeHtml(label)}</option>`;
   }).join("");
   const originalValue = object?.value || "";
   openModal(`
     <form class="form-grid" onsubmit="saveOverride(event, ${objectId}, ${overrideId || "null"})">
       ${state.cache.devicesWarning ? `<div class="error">${escapeHtml(state.cache.devicesWarning)}</div>` : ""}
-      <div class="error">${state.lang === "en" ? "Writing object override to FMC is not documented in this FMC OpenAPI. Saving here updates local records; values from FMC can be loaded using Refresh from FMC." : "Zápis object override do FMC není v této FMC OpenAPI dokumentovaný. Uložení zde aktualizuje lokální evidenci; hodnoty z FMC lze načíst přes Refresh z FMC."}</div>
       <label>Target FW
         <select name="device_id" onchange="applySelectedDevice(this)" required>
           <option value="">Vyberte managed FW</option>
@@ -1384,6 +1395,7 @@ async function openOverrideModal(objectId, overrideId = null) {
         </select>
       </label>
       <input type="hidden" name="device_name" value="${escapeHtml(existing?.device_name || "")}">
+      <input type="hidden" name="device_type" value="${escapeHtml(existing?.raw_fmc_payload?.overrides?.target?.type || existing?.raw_fmc_payload?.target?.type || "Device")}">
       <label>Target ID
         <input name="target_id_display" class="mono" value="${escapeHtml(existing?.device_id || "")}" disabled>
       </label>
@@ -1397,6 +1409,7 @@ async function openOverrideModal(objectId, overrideId = null) {
         <textarea name="description">${escapeHtml(existing?.description || "")}</textarea>
       </label>
       <div class="modal-footer">
+        ${overrideId ? `<button class="danger" type="button" onclick="deleteOverrideFromModal(${overrideId})">${t("deleteOverrideValue")}</button>` : ""}
         <button type="button" onclick="closeModal()">${t("close")}</button>
         <button class="primary" type="submit">${t("save")}</button>
       </div>
@@ -1418,7 +1431,7 @@ async function saveOverride(event, objectId, overrideId) {
     }
     closeModal();
     await renderObjects();
-    notify(result?.fmc_write?.message || t("overrideSaved"));
+    notify(result?.fmc_write?.message || (result?.fmc_write?.ok ? t("overrideSavedFmc") : t("overrideSavedLocal")));
   } catch (error) {
     modalError(error.message);
   }
@@ -1430,9 +1443,11 @@ function applySelectedDevice(select, keepExistingValue = false) {
   const deviceName = option?.dataset?.name || "";
   const deviceId = select.value || "";
   const nameInput = form.querySelector('input[name="device_name"]');
+  const typeInput = form.querySelector('input[name="device_type"]');
   const idDisplay = form.querySelector('input[name="target_id_display"]');
   const valueInput = form.querySelector('input[name="override_value"]');
   if (nameInput) nameInput.value = deviceName;
+  if (typeInput) typeInput.value = option?.dataset?.type || "Device";
   if (idDisplay) idDisplay.value = deviceId;
   if (valueInput && !keepExistingValue && !valueInput.value) {
     valueInput.value = valueInput.dataset.originalValue || "";
@@ -1440,10 +1455,18 @@ function applySelectedDevice(select, keepExistingValue = false) {
 }
 
 async function deleteOverride(id) {
-  if (!confirm("Smazat override?")) return;
-  await api(`/api/overrides/${id}`, { method: "DELETE" });
+  if (!confirm(t("confirmDeleteOverrideValue"))) return;
+  const result = await api(`/api/overrides/${id}`, { method: "DELETE" });
   await renderObjects();
-  notify("Override smazan.");
+  notify(result?.fmc_write?.message || (result?.fmc_write?.ok ? t("overrideDeletedFmc") : t("overrideDeleted")));
+}
+
+async function deleteOverrideFromModal(id) {
+  if (!confirm(t("confirmDeleteOverrideValue"))) return;
+  const result = await api(`/api/overrides/${id}`, { method: "DELETE" });
+  closeModal();
+  await renderObjects();
+  notify(result?.fmc_write?.message || (result?.fmc_write?.ok ? t("overrideDeletedFmc") : t("overrideDeleted")));
 }
 
 async function renderUsers() {
@@ -1758,6 +1781,7 @@ window.openOverrideModal = openOverrideModal;
 window.saveOverride = saveOverride;
 window.applySelectedDevice = applySelectedDevice;
 window.deleteOverride = deleteOverride;
+window.deleteOverrideFromModal = deleteOverrideFromModal;
 window.openUserModal = openUserModal;
 window.openUserModalById = openUserModalById;
 window.saveUser = saveUser;

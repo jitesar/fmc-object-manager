@@ -529,6 +529,17 @@ def fmc_override_target(payload):
     }
 
 
+def fmc_write_unavailable(message):
+    return {"attempted": False, "ok": False, "message": message}
+
+
+def http_error_body(exc):
+    try:
+        return exc.read().decode("utf-8")
+    except Exception:
+        return ""
+
+
 class FmcClient:
     def __init__(self, base_url, username, password, verify_tls=True, domain_uuid=""):
         self.base_url = base_url.rstrip("/")
@@ -658,6 +669,31 @@ class FmcClient:
             payload["description"] = description
         return payload
 
+    def override_payload(self, object_row, override_value, target_id, target_name, description="", target_type="Device", object_id=None):
+        object_type = normalize_object_type(object_row["object_type"])
+        payload = self.object_payload(
+            object_type,
+            object_row["name"],
+            override_value,
+            description,
+            True,
+            object_id,
+        )
+        parent_type = payload.get("type") or object_type
+        payload["overrides"] = {
+            "parent": {
+                "id": object_row["fmc_id"],
+                "type": parent_type,
+                "name": object_row["name"],
+            },
+            "target": {
+                "id": target_id,
+                "type": target_type or "Device",
+                "name": target_name,
+            },
+        }
+        return payload
+
     def create_object(self, object_type, name, value, description="", overridable=True):
         object_type = normalize_object_type(object_type)
         if object_type not in OBJECT_ENDPOINTS:
@@ -694,6 +730,60 @@ class FmcClient:
         _, parsed = self._request("DELETE", path)
         return parsed
 
+    def create_object_override(self, object_row, override_value, target_id, target_name, description="", target_type="Device"):
+        object_type = normalize_object_type(object_row["object_type"])
+        if object_type not in OBJECT_ENDPOINTS:
+            raise ValueError(f"Unsupported object type: {object_type}")
+        self.authenticate()
+        if not self.domain_uuid:
+            raise ValueError("FMC domain UUID is required.")
+        if not object_row["fmc_id"]:
+            raise ValueError("Parent object FMC ID is required.")
+        endpoint = OBJECT_ENDPOINTS[object_type]
+        path = f"/api/fmc_config/v1/domain/{urllib.parse.quote(self.domain_uuid)}/object/{endpoint}"
+        payload = self.override_payload(object_row, override_value, target_id, target_name, description, target_type)
+        _, parsed = self._request("POST", path, payload)
+        return parsed
+
+    def update_object_override(self, object_row, override_id, override_value, target_id, target_name, description="", target_type="Device"):
+        object_type = normalize_object_type(object_row["object_type"])
+        if object_type not in OBJECT_ENDPOINTS:
+            raise ValueError(f"Unsupported object type: {object_type}")
+        self.authenticate()
+        if not self.domain_uuid:
+            raise ValueError("FMC domain UUID is required.")
+        if not object_row["fmc_id"]:
+            raise ValueError("Parent object FMC ID is required.")
+        if not override_id:
+            return self.create_object_override(object_row, override_value, target_id, target_name, description, target_type)
+        endpoint = OBJECT_ENDPOINTS[object_type]
+        path = (
+            f"/api/fmc_config/v1/domain/{urllib.parse.quote(self.domain_uuid)}/object/{endpoint}/"
+            f"{urllib.parse.quote(object_row['fmc_id'])}?overrideTargetId={urllib.parse.quote(target_id)}"
+        )
+        payload = self.override_payload(object_row, override_value, target_id, target_name, description, target_type, object_row["fmc_id"])
+        _, parsed = self._request("PUT", path, payload)
+        return parsed
+
+    def delete_object_override(self, object_row, target_id):
+        object_type = normalize_object_type(object_row["object_type"])
+        if object_type not in OBJECT_ENDPOINTS:
+            raise ValueError(f"Unsupported object type: {object_type}")
+        self.authenticate()
+        if not self.domain_uuid:
+            raise ValueError("FMC domain UUID is required.")
+        if not object_row["fmc_id"]:
+            raise ValueError("Parent object FMC ID is required.")
+        if not target_id:
+            raise ValueError("Override target ID is required.")
+        endpoint = OBJECT_ENDPOINTS[object_type]
+        path = (
+            f"/api/fmc_config/v1/domain/{urllib.parse.quote(self.domain_uuid)}/object/{endpoint}/"
+            f"{urllib.parse.quote(object_row['fmc_id'])}?overrideTargetId={urllib.parse.quote(target_id)}"
+        )
+        _, parsed = self._request("DELETE", path)
+        return parsed
+
     def list_object_overrides(self, object_type, object_id, limit=200):
         object_type = normalize_object_type(object_type)
         if object_type not in OBJECT_ENDPOINTS:
@@ -705,6 +795,16 @@ class FmcClient:
         path = f"/api/fmc_config/v1/domain/{urllib.parse.quote(self.domain_uuid)}/object/{endpoint}/{urllib.parse.quote(object_id)}/overrides?limit={limit}"
         _, parsed = self._request("GET", path)
         return parsed
+
+    def find_object_override_for_target(self, object_type, object_id, target_id, target_name=""):
+        parsed = self.list_object_overrides(object_type, object_id)
+        for item in parsed.get("items", []):
+            target = fmc_override_target(item)
+            if target_id and target.get("id") == target_id:
+                return item
+            if target_name and target.get("name") == target_name:
+                return item
+        return None
 
     def list_devices(self, limit=200):
         self.authenticate()
@@ -767,6 +867,12 @@ def object_payload_from_row(row):
     else:
         sync_state = "local_only"
     data["sync_state"] = sync_state
+    return data
+
+
+def override_payload_from_row(row):
+    data = row_to_dict(row)
+    data["raw_fmc_payload"] = json_loads(data.get("raw_fmc_payload"), None)
     return data
 
 
@@ -1558,10 +1664,23 @@ class Handler(BaseHTTPRequestHandler):
         if not row:
             raise AppError(HTTPStatus.NOT_FOUND, "Objekt nenalezen.")
         fmc_write = {"attempted": False, "ok": False}
-        if row["fmc_id"] and fmc_configured(db):
+        if row["source"] == "missing_in_fmc":
+            fmc_write = fmc_write_unavailable("Objekt už ve FMC není, byl smazán pouze z lokální cache.")
+        elif row["fmc_id"] and fmc_configured(db):
             client = FmcClient.from_db(db)
-            client.delete_object(row["object_type"], row["fmc_id"])
-            fmc_write = {"attempted": True, "ok": True, "id": row["fmc_id"]}
+            try:
+                client.delete_object(row["object_type"], row["fmc_id"])
+                fmc_write = {"attempted": True, "ok": True, "id": row["fmc_id"]}
+            except urllib.error.HTTPError as exc:
+                body = http_error_body(exc)
+                if exc.code != 404:
+                    raise AppError(HTTPStatus.BAD_GATEWAY, f"FMC vrátilo HTTP {exc.code}.", body)
+                fmc_write = {
+                    "attempted": True,
+                    "ok": False,
+                    "id": row["fmc_id"],
+                    "message": "Objekt nebyl ve FMC nalezen, byl smazán pouze z lokální cache.",
+                }
         db.execute("DELETE FROM fmc_objects WHERE id = ?", (object_id,))
         audit(db, user, "object.delete", "object", object_id, before=row_to_dict(row), metadata={"fmc_write": fmc_write}, ip_address=self.client_address[0])
         return self.send_json({"ok": True, "fmc_write": fmc_write})
@@ -1689,7 +1808,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def list_overrides(self, db, object_id):
         rows = db.execute("SELECT * FROM fmc_object_overrides WHERE object_id = ? ORDER BY device_name", (object_id,)).fetchall()
-        return self.send_json({"items": [row_to_dict(row) for row in rows]})
+        return self.send_json({"items": [override_payload_from_row(row) for row in rows]})
 
     def create_override(self, db, user, object_id):
         object_row = db.execute("SELECT * FROM fmc_objects WHERE id = ?", (object_id,)).fetchone()
@@ -1700,26 +1819,82 @@ class Handler(BaseHTTPRequestHandler):
         payload = self.read_json()
         device_name = payload.get("device_name", "").strip()
         device_id = payload.get("device_id", "").strip()
+        device_type = payload.get("device_type", "Device").strip() or "Device"
         override_value = payload.get("override_value", "").strip()
         description = payload.get("description", "").strip()
         if not device_name or not device_id or not override_value:
             raise AppError(HTTPStatus.BAD_REQUEST, "Target firewall, jeho ID a override hodnota jsou povinne.")
         ts = now_iso()
+        fmc_id = None
+        raw_fmc_payload = None
+        source = "local"
+        last_seen_at = None
+        if fmc_configured(db) and object_row["fmc_id"]:
+            client = FmcClient.from_db(db)
+            write_mode = "created"
+            existing_fmc_override = None
+            try:
+                fmc_object = client.create_object_override(object_row, override_value, device_id, device_name, description, device_type)
+            except urllib.error.HTTPError as exc:
+                body = http_error_body(exc)
+                if exc.code != 400 or "already overridden" not in body.lower():
+                    raise AppError(HTTPStatus.BAD_GATEWAY, f"FMC vrátilo HTTP {exc.code}.", body)
+                existing_fmc_override = client.find_object_override_for_target(object_row["object_type"], object_row["fmc_id"], device_id, device_name)
+                if not existing_fmc_override or not existing_fmc_override.get("id"):
+                    raise AppError(
+                        HTTPStatus.BAD_GATEWAY,
+                        "FMC hlásí, že override pro tento target už existuje, ale nepodařilo se načíst jeho ID pro PUT.",
+                        body,
+                    )
+                fmc_object = client.update_object_override(
+                    object_row,
+                    existing_fmc_override["id"],
+                    override_value,
+                    device_id,
+                    device_name,
+                    description,
+                    device_type,
+                )
+                write_mode = "updated_existing"
+            fmc_id = fmc_object.get("id") or (existing_fmc_override or {}).get("id")
+            raw_fmc_payload = json.dumps(fmc_object, ensure_ascii=False)
+            source = "fmc"
+            last_seen_at = ts
+            fmc_write = {
+                "attempted": True,
+                "ok": True,
+                "id": fmc_id,
+                "mode": write_mode,
+                "message": "Override už ve FMC existoval, byl aktualizován přes PUT." if write_mode == "updated_existing" else "Override byl uložen do FMC.",
+            }
+        elif not object_row["fmc_id"]:
+            fmc_write = fmc_write_unavailable("Override byl uložen lokálně. Objekt zatím nemá FMC ID, proto jej nejde zapsat do FMC.")
+        else:
+            fmc_write = fmc_write_unavailable("Override byl uložen lokálně. FMC konektor není nastavený.")
         cursor = db.execute(
             """
-            INSERT INTO fmc_object_overrides(object_id, device_name, device_id, override_value, description, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO fmc_object_overrides(object_id, fmc_id, device_name, device_id, override_value, description, raw_fmc_payload, source, last_seen_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(object_id, device_name) DO UPDATE SET
+              fmc_id = excluded.fmc_id,
+              device_id = excluded.device_id,
+              override_value = excluded.override_value,
+              description = excluded.description,
+              raw_fmc_payload = excluded.raw_fmc_payload,
+              source = excluded.source,
+              last_seen_at = excluded.last_seen_at,
+              updated_at = excluded.updated_at
             """,
-            (object_id, device_name, device_id, override_value, description, ts, ts),
+            (object_id, fmc_id, device_name, device_id, override_value, description, raw_fmc_payload, source, last_seen_at, ts, ts),
         )
-        after = row_to_dict(db.execute("SELECT * FROM fmc_object_overrides WHERE id = ?", (cursor.lastrowid,)).fetchone())
-        fmc_write = {
-            "attempted": False,
-            "ok": False,
-            "message": "Override byl uložen lokálně. FMC OpenAPI pro object override v této instanci nabízí pouze GET endpointy, ne dokumentovaný zápis do FMC.",
-        }
-        audit(db, user, "override.create", "override", cursor.lastrowid, after=after, metadata={"fmc_write": fmc_write}, ip_address=self.client_address[0])
-        return self.send_json({"id": cursor.lastrowid, "fmc_write": fmc_write}, HTTPStatus.CREATED)
+        after = row_to_dict(
+            db.execute(
+                "SELECT * FROM fmc_object_overrides WHERE object_id = ? AND device_name = ?",
+                (object_id, device_name),
+            ).fetchone()
+        )
+        audit(db, user, "override.create", "override", after["id"], after=after, metadata={"fmc_write": fmc_write}, ip_address=self.client_address[0])
+        return self.send_json({"id": after["id"], "fmc_write": fmc_write}, HTTPStatus.CREATED)
 
     def update_override(self, db, user, override_id):
         row = db.execute("SELECT * FROM fmc_object_overrides WHERE id = ?", (override_id,)).fetchone()
@@ -1731,21 +1906,41 @@ class Handler(BaseHTTPRequestHandler):
             raise AppError(HTTPStatus.BAD_REQUEST, "Objekt nemá povolený override. Nejdříve v detailu objektu zapněte 'Povolit override' a uložte objekt do FMC.")
         device_name = payload.get("device_name", row["device_name"]).strip()
         device_id = payload.get("device_id", row["device_id"] or "").strip()
+        device_type = payload.get("device_type", "Device").strip() or "Device"
         override_value = payload.get("override_value", row["override_value"]).strip()
         description = payload.get("description", row["description"] or "").strip()
         if not device_name or not device_id or not override_value:
             raise AppError(HTTPStatus.BAD_REQUEST, "Target firewall, jeho ID a override hodnota jsou povinné.")
         before = row_to_dict(row)
+        fmc_id = row["fmc_id"]
+        raw_fmc_payload = row["raw_fmc_payload"]
+        source = row["source"]
+        last_seen_at = row["last_seen_at"]
+        ts = now_iso()
+        if fmc_configured(db) and object_row and object_row["fmc_id"]:
+            client = FmcClient.from_db(db)
+            fmc_object = client.update_object_override(object_row, row["fmc_id"], override_value, device_id, device_name, description, device_type)
+            fmc_id = fmc_object.get("id", row["fmc_id"])
+            raw_fmc_payload = json.dumps(fmc_object, ensure_ascii=False)
+            source = "fmc"
+            last_seen_at = ts
+            fmc_write = {"attempted": True, "ok": True, "id": fmc_id, "message": "Override byl uložen do FMC."}
+        elif not object_row or not object_row["fmc_id"]:
+            source = "local_modified" if row["fmc_id"] else "local"
+            fmc_write = fmc_write_unavailable("Override byl uložen lokálně. Objekt zatím nemá FMC ID, proto jej nejde zapsat do FMC.")
+        else:
+            source = "local_modified" if row["fmc_id"] else "local"
+            fmc_write = fmc_write_unavailable("Override byl uložen lokálně. FMC konektor není nastavený.")
         db.execute(
-            "UPDATE fmc_object_overrides SET device_name = ?, device_id = ?, override_value = ?, description = ?, updated_at = ? WHERE id = ?",
-            (device_name, device_id, override_value, description, now_iso(), override_id),
+            """
+            UPDATE fmc_object_overrides
+            SET fmc_id = ?, device_name = ?, device_id = ?, override_value = ?, description = ?,
+                raw_fmc_payload = ?, source = ?, last_seen_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (fmc_id, device_name, device_id, override_value, description, raw_fmc_payload, source, last_seen_at, ts, override_id),
         )
         after = row_to_dict(db.execute("SELECT * FROM fmc_object_overrides WHERE id = ?", (override_id,)).fetchone())
-        fmc_write = {
-            "attempted": False,
-            "ok": False,
-            "message": "Override byl uložen lokálně. FMC OpenAPI pro object override v této instanci nabízí pouze GET endpointy, ne dokumentovaný zápis do FMC.",
-        }
         audit(db, user, "override.update", "override", override_id, before=before, after=after, metadata={"fmc_write": fmc_write}, ip_address=self.client_address[0])
         after["fmc_write"] = fmc_write
         return self.send_json(after)
@@ -1754,9 +1949,21 @@ class Handler(BaseHTTPRequestHandler):
         row = db.execute("SELECT * FROM fmc_object_overrides WHERE id = ?", (override_id,)).fetchone()
         if not row:
             raise AppError(HTTPStatus.NOT_FOUND, "Override nenalezen.")
+        fmc_write = {"attempted": False, "ok": False}
+        object_row = db.execute("SELECT * FROM fmc_objects WHERE id = ?", (row["object_id"],)).fetchone()
+        if object_row and object_row["fmc_id"] and row["device_id"] and fmc_configured(db):
+            client = FmcClient.from_db(db)
+            client.delete_object_override(object_row, row["device_id"])
+            fmc_write = {"attempted": True, "ok": True, "target_id": row["device_id"], "message": "Override hodnota byla smazána ve FMC."}
+        elif not object_row or not object_row["fmc_id"]:
+            fmc_write = fmc_write_unavailable("Override hodnota byla smazána jen lokálně. Parent objekt nemá FMC ID.")
+        elif not row["device_id"]:
+            fmc_write = fmc_write_unavailable("Override hodnota byla smazána jen lokálně. Chybí target ID pro bezpečné smazání ve FMC.")
+        else:
+            fmc_write = fmc_write_unavailable("Override hodnota byla smazána jen lokálně. FMC konektor není nastavený.")
         db.execute("DELETE FROM fmc_object_overrides WHERE id = ?", (override_id,))
-        audit(db, user, "override.delete", "override", override_id, before=row_to_dict(row), ip_address=self.client_address[0])
-        return self.send_empty()
+        audit(db, user, "override.delete", "override", override_id, before=row_to_dict(row), metadata={"fmc_write": fmc_write}, ip_address=self.client_address[0])
+        return self.send_json({"ok": True, "fmc_write": fmc_write})
 
     def list_change_requests(self, db):
         rows = db.execute(
