@@ -283,7 +283,7 @@ function render() {
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-mark">F</div>
+          <div class="brand-mark"><img src="/FMC.png" alt="FMC"></div>
           <div>
             <div class="brand-title">FMC Object Manager</div>
             <div class="brand-subtitle">${escapeHtml(state.user.display_name)} · ${escapeHtml(state.user.role)}</div>
@@ -357,7 +357,7 @@ function renderLogin(error = "") {
     <section class="login-screen">
       <form class="login-box login-form" onsubmit="login(event)">
         <div class="brand">
-          <div class="brand-mark">F</div>
+          <div class="brand-mark"><img src="/FMC.png" alt="FMC"></div>
           <div>
             <div class="brand-title">FMC Object Manager</div>
             <div class="brand-subtitle">https://10.62.8.190</div>
@@ -410,7 +410,7 @@ async function renderDashboard() {
       <div class="panel">
         <div class="panel-header"><div class="panel-title">${t("objectTypes")}</div></div>
         <div class="table-wrap">
-          <table class="object-table">
+          <table class="summary-table">
             <thead><tr><th>${t("type")}</th><th>${t("count")}</th></tr></thead>
             <tbody>${data.object_types.map((row) => `<tr><td>${escapeHtml(objectTypeLabel(row.object_type))}</td><td>${row.count}</td></tr>`).join("")}</tbody>
           </table>
@@ -794,7 +794,7 @@ function splitPortValue(value = "", objectType = "ProtocolPortObject") {
     return { protocol: "IPv6-ICMP", icmpType: parts[0] || "any", icmpCode: parts[1] || "any", port: "" };
   }
   const other = text.match(/^protocol\s*\/\s*([^/]+)(?:\/(.+))?$/i);
-  if (other) return { protocol: "Other", protocolNumber: other[1] || "", otherPort: other[2] || "any", port: "" };
+  if (other) return { protocol: "Other", protocolNumber: other[1] || "", otherPort: other[2] || "any", port: other[2] || "any" };
   const match = text.match(/^(tcp|udp)\s*\/\s*(.+)$/i);
   if (!match) return { protocol: "TCP", port: value || "" };
   return { protocol: match[1].toUpperCase(), port: match[2], icmpType: "any", icmpCode: "any" };
@@ -1020,10 +1020,9 @@ function portObjectFields(existing, showMode, selectedMode) {
       <input name="name" value="${escapeHtml(existing?.name || "")}" required>
     </label>
     <label>Protocol
-      <select name="port_protocol" onchange="updatePortProtocolFields(this.form)" ${existing?.id ? "disabled" : ""}>
+      <select name="port_protocol" onchange="updatePortProtocolFields(this.form)">
         ${selectOptions(["TCP", "UDP", "ICMP", "IPv6-ICMP", "Other"], port.protocol)}
       </select>
-      ${existing?.id ? `<input type="hidden" name="port_protocol" value="${escapeHtml(port.protocol)}">` : ""}
     </label>
     <label data-port-field="port">Port
       <input name="port_number" class="mono" value="${escapeHtml(port.port || "")}" placeholder="443 nebo 1024-65535">
@@ -1042,6 +1041,37 @@ function portObjectFields(existing, showMode, selectedMode) {
     </div>
     <input type="hidden" name="icmp_code_value" value="${escapeHtml(port.icmpCode || "any")}">
     ${commonObjectFields(existing)}
+  `;
+}
+
+function portOverrideValueFields(object, existing, originalValue) {
+  const currentValue = existing?.override_value || originalValue || "";
+  const port = splitPortValue(currentValue, object?.object_type || "ProtocolPortObject");
+  return `
+    <label>${t("originalValue")}
+      <input class="mono" value="${escapeHtml(originalValue)}" disabled>
+    </label>
+    <label>Protocol
+      <select name="port_protocol" onchange="updatePortProtocolFields(this.form)">
+        ${selectOptions(["TCP", "UDP", "ICMP", "IPv6-ICMP", "Other"], port.protocol)}
+      </select>
+    </label>
+    <label data-port-field="port">Port
+      <input name="port_number" class="mono" value="${escapeHtml(port.port || "")}" placeholder="443 nebo 1024-65535">
+    </label>
+    <div data-port-field="icmp" class="field-pair">
+      <label>Type
+        <select name="icmp_type" onchange="updatePortProtocolFields(this.form)">
+          ${icmpOptions(port.icmpType || "any")}
+        </select>
+      </label>
+      <label>Code
+        <select name="icmp_code">
+          ${icmpCodeOptions(port.icmpCode || "any")}
+        </select>
+      </label>
+    </div>
+    <input type="hidden" name="icmp_code_value" value="${escapeHtml(port.icmpCode || "any")}">
   `;
 }
 
@@ -1094,6 +1124,42 @@ function updatePortProtocolFields(form) {
     });
   });
   updateIcmpCodeState(form);
+}
+
+function portValueFromForm(form) {
+  const protocol = form.querySelector('select[name="port_protocol"]')?.value || form.querySelector('input[name="port_protocol"]')?.value || "TCP";
+  if (protocol === "ICMP") {
+    return {
+      object_type: "ICMPV4Object",
+      value: `icmp/${(form.querySelector('[name="icmp_type"]')?.value || "any").trim()}/${(form.querySelector('[name="icmp_code"]')?.value || "any").trim()}`,
+    };
+  }
+  if (protocol === "IPv6-ICMP") {
+    return {
+      object_type: "ICMPV6Object",
+      value: `ipv6-icmp/${(form.querySelector('[name="icmp_type"]')?.value || "any").trim()}/${(form.querySelector('[name="icmp_code"]')?.value || "any").trim()}`,
+    };
+  }
+  if (protocol === "Other") {
+    return {
+      object_type: "ProtocolPortObject",
+      value: `protocol/all/${(form.querySelector('[name="port_number"]')?.value || "").trim()}`,
+    };
+  }
+  return {
+    object_type: "ProtocolPortObject",
+    value: `${protocol.toLowerCase()}/${(form.querySelector('[name="port_number"]')?.value || "").trim()}`,
+  };
+}
+
+function cleanupPortFormBody(body) {
+  delete body.port_protocol;
+  delete body.port_number;
+  delete body.icmp_type;
+  delete body.icmp_code;
+  delete body.icmp_code_value;
+  delete body.port_mode;
+  delete body.port_group_member;
 }
 
 function portGroupFields(existing, showMode) {
@@ -1316,20 +1382,9 @@ function prepareObjectPayload(form, body) {
     body.object_type = "PortGroup";
   }
   if (isPortObjectType(body.object_type)) {
-    const protocol = body.port_protocol || "TCP";
-    if (protocol === "ICMP") {
-      body.object_type = "ICMPV4Object";
-      body.value = `icmp/${(body.icmp_type || "any").trim()}/${(body.icmp_code || "any").trim()}`;
-    } else if (protocol === "IPv6-ICMP") {
-      body.object_type = "ICMPV6Object";
-      body.value = `ipv6-icmp/${(body.icmp_type || "any").trim()}/${(body.icmp_code || "any").trim()}`;
-    } else if (protocol === "Other") {
-      body.object_type = "ProtocolPortObject";
-      body.value = `protocol/all/${(body.port_number || "").trim()}`;
-    } else {
-      const port = (body.port_number || "").trim();
-      body.value = `${protocol.toLowerCase()}/${port}`;
-    }
+    const portValue = portValueFromForm(form);
+    body.object_type = portValue.object_type;
+    body.value = portValue.value;
   }
   if (body.object_type === "PortGroup") {
     const members = [...form.querySelectorAll('input[name="port_group_member"]:checked')].map((input) => ({
@@ -1339,13 +1394,7 @@ function prepareObjectPayload(form, body) {
     }));
     body.value = JSON.stringify(members);
   }
-  delete body.port_protocol;
-  delete body.port_number;
-  delete body.icmp_type;
-  delete body.icmp_code;
-  delete body.icmp_code_value;
-  delete body.port_mode;
-  delete body.port_group_member;
+  cleanupPortFormBody(body);
   delete body.network_mode;
   delete body.network_subtype;
   delete body.network_group_member;
@@ -1385,6 +1434,16 @@ async function openOverrideModal(objectId, overrideId = null) {
     return `<option value="${escapeHtml(device.id)}" data-name="${escapeHtml(device.name)}" data-type="${escapeHtml(device.type || "Device")}" ${selectedDeviceId === device.id ? "selected" : ""}>${escapeHtml(label)}</option>`;
   }).join("");
   const originalValue = object?.value || "";
+  const overrideValueFields = object && isPortObjectType(object.object_type)
+    ? portOverrideValueFields(object, existing, originalValue)
+    : `
+      <label>${t("originalValue")}
+        <input class="mono" value="${escapeHtml(originalValue)}" disabled>
+      </label>
+      <label>Override hodnota
+        <input name="override_value" class="mono" value="${escapeHtml(existing?.override_value || originalValue)}" data-original-value="${escapeHtml(originalValue)}" required>
+      </label>
+    `;
   openModal(`
     <form class="form-grid" onsubmit="saveOverride(event, ${objectId}, ${overrideId || "null"})">
       ${state.cache.devicesWarning ? `<div class="error">${escapeHtml(state.cache.devicesWarning)}</div>` : ""}
@@ -1399,12 +1458,7 @@ async function openOverrideModal(objectId, overrideId = null) {
       <label>Target ID
         <input name="target_id_display" class="mono" value="${escapeHtml(existing?.device_id || "")}" disabled>
       </label>
-      <label>${t("originalValue")}
-        <input class="mono" value="${escapeHtml(originalValue)}" disabled>
-      </label>
-      <label>Override hodnota
-        <input name="override_value" class="mono" value="${escapeHtml(existing?.override_value || originalValue)}" data-original-value="${escapeHtml(originalValue)}" required>
-      </label>
+      ${overrideValueFields}
       <label>Description
         <textarea name="description">${escapeHtml(existing?.description || "")}</textarea>
       </label>
@@ -1417,11 +1471,20 @@ async function openOverrideModal(objectId, overrideId = null) {
   `, overrideId ? `${t("edit")} override` : `${t("newObject")} override`);
   const select = document.querySelector('#modal select[name="device_id"]');
   if (select) applySelectedDevice(select, Boolean(existing?.override_value));
+  const form = document.querySelector("#modal form");
+  if (form) updatePortProtocolFields(form);
 }
 
 async function saveOverride(event, objectId, overrideId) {
   event.preventDefault();
-  const body = Object.fromEntries(new FormData(event.target).entries());
+  const form = event.target;
+  const body = Object.fromEntries(new FormData(form).entries());
+  if (form.querySelector('select[name="port_protocol"]')) {
+    const portValue = portValueFromForm(form);
+    body.override_value = portValue.value;
+    body.override_object_type = portValue.object_type;
+    cleanupPortFormBody(body);
+  }
   try {
     let result;
     if (overrideId) {

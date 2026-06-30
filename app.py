@@ -669,8 +669,9 @@ class FmcClient:
             payload["description"] = description
         return payload
 
-    def override_payload(self, object_row, override_value, target_id, target_name, description="", target_type="Device", object_id=None):
-        object_type = normalize_object_type(object_row["object_type"])
+    def override_payload(self, object_row, override_value, target_id, target_name, description="", target_type="Device", object_id=None, override_object_type=None):
+        parent_type = normalize_object_type(object_row["object_type"])
+        object_type = normalize_object_type(override_object_type or parent_type)
         payload = self.object_payload(
             object_type,
             object_row["name"],
@@ -679,7 +680,6 @@ class FmcClient:
             True,
             object_id,
         )
-        parent_type = payload.get("type") or object_type
         payload["overrides"] = {
             "parent": {
                 "id": object_row["fmc_id"],
@@ -730,7 +730,7 @@ class FmcClient:
         _, parsed = self._request("DELETE", path)
         return parsed
 
-    def create_object_override(self, object_row, override_value, target_id, target_name, description="", target_type="Device"):
+    def create_object_override(self, object_row, override_value, target_id, target_name, description="", target_type="Device", override_object_type=None):
         object_type = normalize_object_type(object_row["object_type"])
         if object_type not in OBJECT_ENDPOINTS:
             raise ValueError(f"Unsupported object type: {object_type}")
@@ -741,11 +741,11 @@ class FmcClient:
             raise ValueError("Parent object FMC ID is required.")
         endpoint = OBJECT_ENDPOINTS[object_type]
         path = f"/api/fmc_config/v1/domain/{urllib.parse.quote(self.domain_uuid)}/object/{endpoint}"
-        payload = self.override_payload(object_row, override_value, target_id, target_name, description, target_type)
+        payload = self.override_payload(object_row, override_value, target_id, target_name, description, target_type, override_object_type=override_object_type)
         _, parsed = self._request("POST", path, payload)
         return parsed
 
-    def update_object_override(self, object_row, override_id, override_value, target_id, target_name, description="", target_type="Device"):
+    def update_object_override(self, object_row, override_id, override_value, target_id, target_name, description="", target_type="Device", override_object_type=None):
         object_type = normalize_object_type(object_row["object_type"])
         if object_type not in OBJECT_ENDPOINTS:
             raise ValueError(f"Unsupported object type: {object_type}")
@@ -755,13 +755,13 @@ class FmcClient:
         if not object_row["fmc_id"]:
             raise ValueError("Parent object FMC ID is required.")
         if not override_id:
-            return self.create_object_override(object_row, override_value, target_id, target_name, description, target_type)
+            return self.create_object_override(object_row, override_value, target_id, target_name, description, target_type, override_object_type)
         endpoint = OBJECT_ENDPOINTS[object_type]
         path = (
             f"/api/fmc_config/v1/domain/{urllib.parse.quote(self.domain_uuid)}/object/{endpoint}/"
-            f"{urllib.parse.quote(object_row['fmc_id'])}?overrideTargetId={urllib.parse.quote(target_id)}"
+            f"{urllib.parse.quote(object_row['fmc_id'])}"
         )
-        payload = self.override_payload(object_row, override_value, target_id, target_name, description, target_type, object_row["fmc_id"])
+        payload = self.override_payload(object_row, override_value, target_id, target_name, description, target_type, object_row["fmc_id"], override_object_type)
         _, parsed = self._request("PUT", path, payload)
         return parsed
 
@@ -1821,6 +1821,9 @@ class Handler(BaseHTTPRequestHandler):
         device_id = payload.get("device_id", "").strip()
         device_type = payload.get("device_type", "Device").strip() or "Device"
         override_value = payload.get("override_value", "").strip()
+        override_object_type = normalize_object_type(payload.get("override_object_type") or object_row["object_type"])
+        if object_row["object_type"] not in PORT_OBJECT_TYPES or override_object_type not in PORT_OBJECT_TYPES:
+            override_object_type = object_row["object_type"]
         description = payload.get("description", "").strip()
         if not device_name or not device_id or not override_value:
             raise AppError(HTTPStatus.BAD_REQUEST, "Target firewall, jeho ID a override hodnota jsou povinne.")
@@ -1834,7 +1837,7 @@ class Handler(BaseHTTPRequestHandler):
             write_mode = "created"
             existing_fmc_override = None
             try:
-                fmc_object = client.create_object_override(object_row, override_value, device_id, device_name, description, device_type)
+                fmc_object = client.create_object_override(object_row, override_value, device_id, device_name, description, device_type, override_object_type)
             except urllib.error.HTTPError as exc:
                 body = http_error_body(exc)
                 if exc.code != 400 or "already overridden" not in body.lower():
@@ -1854,6 +1857,7 @@ class Handler(BaseHTTPRequestHandler):
                     device_name,
                     description,
                     device_type,
+                    override_object_type,
                 )
                 write_mode = "updated_existing"
             fmc_id = fmc_object.get("id") or (existing_fmc_override or {}).get("id")
@@ -1908,6 +1912,9 @@ class Handler(BaseHTTPRequestHandler):
         device_id = payload.get("device_id", row["device_id"] or "").strip()
         device_type = payload.get("device_type", "Device").strip() or "Device"
         override_value = payload.get("override_value", row["override_value"]).strip()
+        override_object_type = normalize_object_type(payload.get("override_object_type") or (object_row["object_type"] if object_row else ""))
+        if not object_row or object_row["object_type"] not in PORT_OBJECT_TYPES or override_object_type not in PORT_OBJECT_TYPES:
+            override_object_type = object_row["object_type"] if object_row else ""
         description = payload.get("description", row["description"] or "").strip()
         if not device_name or not device_id or not override_value:
             raise AppError(HTTPStatus.BAD_REQUEST, "Target firewall, jeho ID a override hodnota jsou povinné.")
@@ -1919,7 +1926,7 @@ class Handler(BaseHTTPRequestHandler):
         ts = now_iso()
         if fmc_configured(db) and object_row and object_row["fmc_id"]:
             client = FmcClient.from_db(db)
-            fmc_object = client.update_object_override(object_row, row["fmc_id"], override_value, device_id, device_name, description, device_type)
+            fmc_object = client.update_object_override(object_row, row["fmc_id"], override_value, device_id, device_name, description, device_type, override_object_type)
             fmc_id = fmc_object.get("id", row["fmc_id"])
             raw_fmc_payload = json.dumps(fmc_object, ensure_ascii=False)
             source = "fmc"
