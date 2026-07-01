@@ -8,6 +8,13 @@ const state = {
   selectedObjectId: null,
   objectDetailTab: "global",
   cache: {},
+  debug: {
+    enabled: localStorage.getItem("fmcObjectManager.debug") === "1",
+    filterText: localStorage.getItem("fmcObjectManager.debugFilter") || "",
+    onlyMatches: localStorage.getItem("fmcObjectManager.debugOnlyMatches") === "1",
+    logs: [],
+    nextId: 1,
+  },
 };
 
 const roleLevel = { viewer: 10, operator: 20, approver: 30, admin: 40 };
@@ -107,6 +114,17 @@ const I18N = {
     csvHeaderUppercase: "Hlavička musí být velkými písmeny.",
     sampleData: "Ukázková data:",
     csvImported: "CSV import dokončen",
+    apiDebug: "API debug",
+    apiDebugEmpty: "Zatím žádná API volání.",
+    clearDebug: "Vyčistit",
+    debugFilter: "Filtr objektu",
+    debugFilterPlaceholder: "ID, název, FMC ID nebo hodnota",
+    debugCurrentObject: "Aktuální objekt",
+    debugOnlyMatches: "Jen shody",
+    debugMatches: "shod",
+    request: "Request",
+    response: "Response",
+    duration: "Doba",
   },
   en: {
     dashboard: "Dashboard",
@@ -199,6 +217,17 @@ const I18N = {
     csvHeaderUppercase: "Column header should be in capital letters.",
     sampleData: "Sample data:",
     csvImported: "CSV import finished",
+    apiDebug: "API debug",
+    apiDebugEmpty: "No API calls yet.",
+    clearDebug: "Clear",
+    debugFilter: "Object filter",
+    debugFilterPlaceholder: "ID, name, FMC ID, or value",
+    debugCurrentObject: "Current object",
+    debugOnlyMatches: "Only matches",
+    debugMatches: "matches",
+    request: "Request",
+    response: "Response",
+    duration: "Duration",
   },
 };
 
@@ -234,20 +263,91 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-  if (response.status === 204) return null;
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const message = data.details ? `${data.error}: ${data.details}` : data.error || "Chyba pozadavku";
-    throw new Error(message);
+function redactDebugValue(value, key = "") {
+  const sensitive = /(password|passwd|token|secret|authorization|cookie|session)/i.test(key);
+  if (sensitive && value !== undefined && value !== null && value !== "") return "[redacted]";
+  if (Array.isArray(value)) return value.map((item) => redactDebugValue(item));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([itemKey, itemValue]) => [itemKey, redactDebugValue(itemValue, itemKey)]));
   }
-  return data;
+  return value;
+}
+
+function debugJson(value) {
+  if (value === undefined) return "";
+  if (value === null) return "null";
+  return JSON.stringify(redactDebugValue(value), null, 2);
+}
+
+function startDebugApiCall(method, path, body) {
+  if (!state.debug.enabled) return null;
+  const entry = {
+    id: state.debug.nextId,
+    method,
+    path,
+    request: redactDebugValue(body ?? null),
+    response: null,
+    status: "pending",
+    ok: null,
+    error: "",
+    startedAt: new Date().toLocaleTimeString("cs-CZ"),
+    durationMs: null,
+  };
+  state.debug.nextId += 1;
+  state.debug.logs.unshift(entry);
+  state.debug.logs = state.debug.logs.slice(0, 80);
+  renderDebugPanel();
+  return entry.id;
+}
+
+function finishDebugApiCall(id, patch) {
+  if (!id) return;
+  const entry = state.debug.logs.find((item) => item.id === id);
+  if (!entry) return;
+  Object.assign(entry, patch);
+  renderDebugPanel();
+}
+
+async function api(path, options = {}) {
+  const method = (options.method || "GET").toUpperCase();
+  const started = performance.now();
+  const debugId = startDebugApiCall(method, path, options.body);
+  try {
+    const response = await fetch(path, {
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      ...options,
+      body: options.body ? JSON.stringify(options.body) : undefined,
+    });
+    const data = response.status === 204 ? null : await response.json().catch(() => ({}));
+    finishDebugApiCall(debugId, {
+      response: redactDebugValue(data),
+      status: response.status,
+      ok: response.ok,
+      durationMs: Math.round(performance.now() - started),
+    });
+    if (response.status === 204) return null;
+    if (!response.ok) {
+      const message = data.details ? `${data.error}: ${data.details}` : data.error || "Chyba pozadavku";
+      throw new Error(message);
+    }
+    return data;
+  } catch (error) {
+    const entry = state.debug.logs.find((item) => item.id === debugId);
+    if (entry && entry.status !== "pending") {
+      entry.error = error.message;
+      renderDebugPanel();
+    } else {
+      finishDebugApiCall(debugId, {
+        response: null,
+        status: "error",
+        ok: false,
+        error: error.message,
+        durationMs: Math.round(performance.now() - started),
+      });
+    }
+    throw error;
+  }
 }
 
 function app() {
@@ -266,6 +366,153 @@ function notify(message, type = "success") {
   window.setTimeout(() => {
     if (holder) holder.innerHTML = "";
   }, 4200);
+}
+
+function toggleDebug(enabled) {
+  state.debug.enabled = Boolean(enabled);
+  localStorage.setItem("fmcObjectManager.debug", state.debug.enabled ? "1" : "0");
+  render();
+}
+
+function clearDebugLogs() {
+  state.debug.logs = [];
+  renderDebugPanel();
+}
+
+function debugFilterTokens() {
+  return String(state.debug.filterText || "")
+    .split(/\s+/)
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function selectedDebugObject() {
+  return (state.cache.objects || []).find((item) => String(item.id) === String(state.selectedObjectId)) || null;
+}
+
+function selectedDebugObjectFilter() {
+  const item = selectedDebugObject();
+  if (!item) return "";
+  return [
+    item.id,
+    item.fmc_id,
+    item.name,
+    item.value,
+    item.display_value,
+  ].filter(Boolean).join(" ");
+}
+
+function debugEntryText(entry) {
+  return [
+    entry.method,
+    entry.path,
+    entry.status,
+    entry.error,
+    debugJson(entry.request),
+    debugJson(entry.response),
+  ].join("\n").toLowerCase();
+}
+
+function debugEntryMatches(entry) {
+  const tokens = debugFilterTokens();
+  if (!tokens.length) return false;
+  const text = debugEntryText(entry);
+  return tokens.some((token) => text.includes(token));
+}
+
+function filteredDebugLogs() {
+  const tokens = debugFilterTokens();
+  if (!tokens.length || !state.debug.onlyMatches) return state.debug.logs;
+  return state.debug.logs.filter((entry) => debugEntryMatches(entry));
+}
+
+function setDebugFilter(value) {
+  state.debug.filterText = value || "";
+  localStorage.setItem("fmcObjectManager.debugFilter", state.debug.filterText);
+  refreshDebugList();
+}
+
+function useSelectedDebugObject() {
+  setDebugFilter(selectedDebugObjectFilter());
+  renderDebugPanel();
+}
+
+function toggleDebugOnlyMatches(enabled) {
+  state.debug.onlyMatches = Boolean(enabled);
+  localStorage.setItem("fmcObjectManager.debugOnlyMatches", state.debug.onlyMatches ? "1" : "0");
+  refreshDebugList();
+}
+
+function refreshDebugList() {
+  const list = document.querySelector("[data-debug-list]");
+  if (!list) return;
+  const items = filteredDebugLogs();
+  const matches = state.debug.logs.filter((entry) => debugEntryMatches(entry)).length;
+  const count = document.querySelector("[data-debug-count]");
+  if (count) {
+    count.textContent = `${state.debug.logs.length} ${state.lang === "en" ? "calls" : "volání"} · ${matches} ${t("debugMatches")}`;
+  }
+  list.innerHTML = items.map((entry, index) => debugEntry(entry, index === 0)).join("") || `<div class="empty">${t("apiDebugEmpty")}</div>`;
+}
+
+function renderDebugPanel() {
+  const holder = document.getElementById("debug-panel");
+  if (!holder) return;
+  holder.innerHTML = debugPanel();
+}
+
+function debugPanel() {
+  if (!state.debug.enabled) return "";
+  return `
+    <div class="panel debug-panel">
+      <div class="panel-header">
+        <div>
+          <div class="panel-title">${t("apiDebug")}</div>
+          <div class="muted" data-debug-count>${state.debug.logs.length} ${state.lang === "en" ? "calls" : "volání"} · ${state.debug.logs.filter((entry) => debugEntryMatches(entry)).length} ${t("debugMatches")}</div>
+        </div>
+        <button type="button" onclick="clearDebugLogs()">${t("clearDebug")}</button>
+      </div>
+      <div class="debug-tools">
+        <label>${t("debugFilter")}
+          <input class="mono" value="${escapeHtml(state.debug.filterText)}" placeholder="${t("debugFilterPlaceholder")}" oninput="setDebugFilter(this.value)">
+        </label>
+        <button type="button" onclick="useSelectedDebugObject()" ${selectedDebugObject() ? "" : "disabled"}>${t("debugCurrentObject")}</button>
+        <label class="switch"><input type="checkbox" ${state.debug.onlyMatches ? "checked" : ""} onchange="toggleDebugOnlyMatches(this.checked)"> ${t("debugOnlyMatches")}</label>
+      </div>
+      <div class="debug-list" data-debug-list>
+        ${filteredDebugLogs().map((entry, index) => debugEntry(entry, index === 0)).join("") || `<div class="empty">${t("apiDebugEmpty")}</div>`}
+      </div>
+    </div>
+  `;
+}
+
+function debugEntry(entry, open) {
+  const statusClass = entry.status === "pending" ? "warn" : (entry.ok ? "green" : "red");
+  const matches = debugEntryMatches(entry);
+  const responseText = entry.error
+    ? `${debugJson(entry.response)}\n\nError: ${entry.error}`.trim()
+    : debugJson(entry.response);
+  return `
+    <details class="debug-entry ${matches ? "debug-match" : ""}" ${open ? "open" : ""}>
+      <summary>
+        <span class="debug-method">${escapeHtml(entry.method)}</span>
+        <strong>${escapeHtml(entry.path)}</strong>
+        ${matches ? `<span class="pill blue">${t("debugMatches")}</span>` : ""}
+        <span class="pill ${statusClass}">${escapeHtml(entry.status)}</span>
+        <span class="muted">${entry.durationMs === null ? entry.startedAt : `${t("duration")}: ${entry.durationMs} ms`}</span>
+      </summary>
+      <div class="debug-body">
+        <div>
+          <h4>${t("request")}</h4>
+          <pre>${escapeHtml(debugJson(entry.request))}</pre>
+        </div>
+        <div>
+          <h4>${t("response")}</h4>
+          <pre>${escapeHtml(responseText)}</pre>
+        </div>
+      </div>
+    </details>
+  `;
 }
 
 async function init() {
@@ -299,6 +546,7 @@ function render() {
         </nav>
         <div class="sidebar-footer">
           ${langToggle()}
+          <label class="switch debug-switch"><input type="checkbox" ${state.debug.enabled ? "checked" : ""} onchange="toggleDebug(this.checked)"> ${t("apiDebug")}</label>
           <button class="ghost" onclick="openPasswordModal()">${t("changePassword")}</button>
           <button onclick="logout()">${t("logout")}</button>
         </div>
@@ -314,6 +562,7 @@ function render() {
         <section class="content">
           <div data-flash></div>
           <div id="view"></div>
+          <div id="debug-panel">${debugPanel()}</div>
         </section>
       </main>
     </div>
@@ -590,6 +839,7 @@ async function renderObjects() {
     renderObjects();
   });
   if (selected) renderObjectTab(selected);
+  renderDebugPanel();
 }
 
 function objectDetailShell(item) {
@@ -1828,6 +2078,11 @@ function debounce(fn, wait) {
 window.login = login;
 window.logout = logout;
 window.setLanguage = setLanguage;
+window.toggleDebug = toggleDebug;
+window.clearDebugLogs = clearDebugLogs;
+window.setDebugFilter = setDebugFilter;
+window.useSelectedDebugObject = useSelectedDebugObject;
+window.toggleDebugOnlyMatches = toggleDebugOnlyMatches;
 window.openPasswordModal = openPasswordModal;
 window.changePassword = changePassword;
 window.openObjectModal = openObjectModal;
