@@ -29,6 +29,7 @@ SECRET_PATH = DATA_DIR / "app.secret"
 SESSION_COOKIE = "fmc_object_manager_session"
 SESSION_TTL_SECONDS = 8 * 60 * 60
 PBKDF2_ITERATIONS = 310_000
+UTC = dt.timezone.utc
 
 ROLE_LEVELS = {
     "viewer": 10,
@@ -62,7 +63,7 @@ OBJECT_TYPE_ALIASES = {
 
 
 def now_iso():
-    return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+    return dt.datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 def json_dumps(data):
@@ -1044,6 +1045,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.sync_fmc_objects(db, user)
         if method == "GET" and path == "/api/fmc/devices":
             return self.list_fmc_devices(db)
+        if method == "GET" and path == "/api/overridable-objects":
+            return self.list_overridable_objects(db, query)
 
         if path == "/api/objects":
             if method == "GET":
@@ -1114,12 +1117,12 @@ class Handler(BaseHTTPRequestHandler):
             failed = user["failed_attempts"] + 1
             locked_until = None
             if failed >= 5:
-                locked_until = (dt.datetime.now(dt.UTC) + dt.timedelta(minutes=15)).replace(microsecond=0).isoformat()
+                locked_until = (dt.datetime.now(UTC) + dt.timedelta(minutes=15)).replace(microsecond=0).isoformat()
             db.execute("UPDATE users SET failed_attempts = ?, locked_until = ?, updated_at = ? WHERE id = ?", (failed, locked_until, now_iso(), user["id"]))
             audit(db, user, "auth.login_failed", "user", user["id"], ip_address=self.client_address[0])
             raise AppError(HTTPStatus.UNAUTHORIZED, "Neplatné přihlášení.")
         session_id = secrets.token_urlsafe(32)
-        expires_at = (dt.datetime.now(dt.UTC) + dt.timedelta(seconds=SESSION_TTL_SECONDS)).replace(microsecond=0).isoformat()
+        expires_at = (dt.datetime.now(UTC) + dt.timedelta(seconds=SESSION_TTL_SECONDS)).replace(microsecond=0).isoformat()
         db.execute(
             "INSERT INTO sessions(id, user_id, expires_at, created_at, last_seen_at, ip_address) VALUES (?, ?, ?, ?, ?, ?)",
             (session_id, user["id"], expires_at, now_iso(), now_iso(), self.client_address[0]),
@@ -1543,6 +1546,62 @@ class Handler(BaseHTTPRequestHandler):
                 "source_counts": source_counts,
             }
         )
+
+    def list_overridable_objects(self, db, query):
+        q = (query.get("q", [""])[0] or "").strip()
+        object_type = normalize_object_type(query.get("type", [""])[0])
+        params = []
+        where = ["o.overridable = 1", "o.object_type IN ({})".format(",".join("?" for _ in OBJECT_ENDPOINTS))]
+        params.extend(OBJECT_ENDPOINTS.keys())
+        if object_type:
+            if object_type == "ProtocolPortObject":
+                where.append("o.object_type IN ({})".format(",".join("?" for _ in PORT_OBJECT_TYPES)))
+                params.extend(PORT_OBJECT_TYPES)
+            else:
+                where.append("o.object_type = ?")
+                params.append(object_type)
+        if q:
+            where.append(
+                """
+                (
+                  o.name LIKE ? OR o.value LIKE ? OR o.description LIKE ? OR o.fmc_id LIKE ?
+                  OR EXISTS (
+                    SELECT 1 FROM fmc_object_overrides v
+                    WHERE v.object_id = o.id
+                      AND (v.device_name LIKE ? OR v.device_id LIKE ? OR v.override_value LIKE ? OR v.description LIKE ?)
+                  )
+                )
+                """
+            )
+            like = f"%{q}%"
+            params.extend([like, like, like, like, like, like, like, like])
+        rows = db.execute(
+            f"""
+            SELECT o.*, COUNT(v.id) AS override_count
+            FROM fmc_objects o
+            LEFT JOIN fmc_object_overrides v ON v.object_id = o.id
+            WHERE {" AND ".join(where)}
+            GROUP BY o.id
+            ORDER BY o.object_type, o.name
+            LIMIT 500
+            """,
+            params,
+        ).fetchall()
+        items = []
+        for row in rows:
+            item = object_payload_from_row(row)
+            override_rows = db.execute(
+                """
+                SELECT *
+                FROM fmc_object_overrides
+                WHERE object_id = ?
+                ORDER BY device_name, device_id
+                """,
+                (row["id"],),
+            ).fetchall()
+            item["overrides"] = [override_payload_from_row(override_row) for override_row in override_rows]
+            items.append(item)
+        return self.send_json({"items": items, "types": PUBLIC_OBJECT_TYPES})
 
     def get_object(self, db, object_id):
         row = db.execute(

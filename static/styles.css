@@ -669,6 +669,89 @@ tr:hover td {
   background: #e7f1ff;
 }
 
+.override-matrix {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  background: #f8fafc;
+}
+
+.override-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: var(--shadow-soft);
+}
+
+.override-card-main {
+  display: grid;
+  gap: 10px;
+  align-items: start;
+}
+
+.override-card-main {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.object-name {
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 820;
+}
+
+.override-table {
+  display: grid;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+
+.override-table-head,
+.override-table-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.2fr) minmax(180px, 1fr) minmax(180px, 1fr) minmax(110px, auto);
+  gap: 14px;
+  align-items: center;
+  padding: 10px 12px;
+}
+
+.override-table-head {
+  min-height: 36px;
+  border-bottom: 1px solid var(--line);
+  background: #f8fafc;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.override-table-row {
+  min-height: 52px;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+
+.override-table-row:last-child {
+  border-bottom: 0;
+}
+
+.override-table-row.global-row {
+  background: #f4f8ff;
+}
+
+.override-table-row > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.override-table-row > :last-child,
+.override-table-head > :last-child {
+  justify-self: end;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;
@@ -983,8 +1066,16 @@ tr:hover td {
   .metrics,
   .grid-2,
   .debug-body,
-  .debug-tools {
+  .debug-tools,
+  .override-card-main,
+  .override-table-head,
+  .override-table-row {
     grid-template-columns: 1fr;
+  }
+
+  .override-table-row > :last-child,
+  .override-table-head > :last-child {
+    justify-self: start;
   }
 
   .topbar {

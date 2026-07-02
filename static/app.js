@@ -4,6 +4,7 @@ const state = {
   lang: localStorage.getItem("fmcObjectManager.lang") || "cs",
   busy: { sync: false, refreshId: null },
   objectFilters: { q: "", type: "", source: "" },
+  overridableFilters: { q: "", type: "" },
   objectSort: { key: "name", direction: "asc" },
   selectedObjectId: null,
   objectDetailTab: "global",
@@ -26,6 +27,7 @@ const I18N = {
   cs: {
     dashboard: "Dashboard",
     objects: "Objekty",
+    overridableObjects: "Overridable objekty",
     changes: "Změny",
     audit: "Audit",
     users: "Uživatelé",
@@ -91,6 +93,10 @@ const I18N = {
     groupName: "Název skupiny",
     originalValue: "Původní hodnota objektu",
     overrideValue: "Override hodnota",
+    overrideVariants: "Override varianty",
+    noOverridableObjects: "Žádné overridable objekty",
+    noOverrideVariants: "Bez override variant",
+    originalVsOverrides: "Originální hodnoty a override varianty",
     targetFw: "Target FW",
     targetId: "Target ID",
     noOverrides: "Bez override",
@@ -129,6 +135,7 @@ const I18N = {
   en: {
     dashboard: "Dashboard",
     objects: "Objects",
+    overridableObjects: "Overridable objects",
     changes: "Changes",
     audit: "Audit",
     users: "Users",
@@ -194,6 +201,10 @@ const I18N = {
     groupName: "Group name",
     originalValue: "Original object value",
     overrideValue: "Override value",
+    overrideVariants: "Override variants",
+    noOverridableObjects: "No overridable objects",
+    noOverrideVariants: "No override variants",
+    originalVsOverrides: "Original values and override variants",
     targetFw: "Target FW",
     targetId: "Target ID",
     noOverrides: "No overrides",
@@ -539,6 +550,7 @@ function render() {
         <nav class="nav">
           ${navButton("dashboard", t("dashboard"))}
           ${navButton("objects", t("objects"))}
+          ${navButton("overridable", t("overridableObjects"))}
           ${navButton("changes", t("changes"))}
           ${navButton("audit", t("audit"))}
           ${can("admin") ? navButton("users", t("users")) : ""}
@@ -582,6 +594,7 @@ function pageTitle() {
   return {
     dashboard: "Dashboard",
     objects: t("objects"),
+    overridable: t("overridableObjects"),
     changes: t("changes"),
     audit: t("audit"),
     users: t("users"),
@@ -590,9 +603,12 @@ function pageTitle() {
 }
 
 function renderView() {
+  const topbar = document.querySelector("[data-topbar-actions]");
+  if (topbar) topbar.innerHTML = "";
   const views = {
     dashboard: renderDashboard,
     objects: renderObjects,
+    overridable: renderOverridableObjects,
     changes: renderChanges,
     audit: renderAudit,
     users: renderUsers,
@@ -947,6 +963,88 @@ async function renderObjectOverrides(objectId) {
         </tbody>
       </table>
     </div>
+  `;
+}
+
+async function renderOverridableObjects() {
+  const params = new URLSearchParams();
+  if (state.overridableFilters.q) params.set("q", state.overridableFilters.q);
+  if (state.overridableFilters.type) params.set("type", state.overridableFilters.type);
+  const data = await api(`/api/overridable-objects?${params}`);
+  const items = data.items || [];
+  const topbar = document.querySelector("[data-topbar-actions]");
+  topbar.innerHTML = can("operator") ? `
+    <button data-action="sync" onclick="syncFmc()" ${state.busy.sync ? "disabled" : ""}>${state.busy.sync ? `<span class="spinner"></span>${t("syncing")}` : t("syncFmc")}</button>
+  ` : "";
+  document.getElementById("view").innerHTML = `
+    <div class="panel">
+      <div class="panel-header">
+        <div>
+          <div class="panel-title">${t("overridableObjects")}</div>
+          <div class="muted">${t("originalVsOverrides")}</div>
+        </div>
+        <div class="toolbar">
+          <input id="overridable-search" placeholder="${t("search")}" value="${escapeHtml(state.overridableFilters.q)}">
+          <select id="overridable-type">
+            ${objectTypeOptions(state.overridableFilters.type, true)}
+          </select>
+        </div>
+      </div>
+      <div class="override-matrix">
+        ${items.map(overridableObjectCard).join("") || `<div class="empty">${t("noOverridableObjects")}</div>`}
+      </div>
+    </div>
+  `;
+  document.getElementById("overridable-search").addEventListener("input", debounce((event) => {
+    state.overridableFilters.q = event.target.value;
+    renderOverridableObjects();
+  }, 250));
+  document.getElementById("overridable-type").addEventListener("change", (event) => {
+    state.overridableFilters.type = event.target.value;
+    renderOverridableObjects();
+  });
+  renderDebugPanel();
+}
+
+function overridableObjectCard(item) {
+  return `
+    <section class="override-card">
+      <div class="override-card-main">
+        <div>
+          <div class="object-name">${escapeHtml(item.name)}</div>
+          <div class="muted">${escapeHtml(objectTypeLabel(item.object_type))} · ${sourceLabel(item).label}</div>
+        </div>
+        <span class="pill ${item.override_count ? "green" : ""}">${Number(item.override_count || 0)} ${t("overrideVariants")}</span>
+      </div>
+      <div class="override-table">
+        <div class="override-table-head">
+          <span>${t("targetFw")}</span>
+          <span>${t("value")}</span>
+          <span>${t("description")}</span>
+          <span>Source</span>
+        </div>
+        <div class="override-table-row global-row">
+          <div>
+            <strong>${t("globalValue")}</strong>
+            <div class="muted mono">${escapeHtml(item.fmc_id || item.domain_id || "-")}</div>
+          </div>
+          <strong class="mono">${escapeHtml(item.display_value || item.value || "-")}</strong>
+          <strong>${escapeHtml(item.description || "-")}</strong>
+          <strong>${sourcePill(item)}</strong>
+        </div>
+        ${(item.overrides || []).map((override) => `
+          <div class="override-table-row">
+            <div>
+              <strong>${escapeHtml(override.device_name || "-")}</strong>
+              <div class="muted mono">${escapeHtml(override.device_id || "-")}</div>
+            </div>
+            <strong class="mono">${escapeHtml(override.override_value || "-")}</strong>
+            <strong>${escapeHtml(override.description || "-")}</strong>
+            <strong><span class="pill ${override.source === "fmc" ? "green" : "warn"}">${escapeHtml(override.source || "local")}</span></strong>
+          </div>
+        `).join("") || `<div class="empty compact">${t("noOverrideVariants")}</div>`}
+      </div>
+    </section>
   `;
 }
 
@@ -1930,6 +2028,7 @@ async function syncFmc(objectType = "all") {
       result.local_modified = partial.local_modified || result.local_modified;
     }
     if (state.view === "objects") await renderObjects();
+    if (state.view === "overridable") await renderOverridableObjects();
     const label = objectType === "all" ? (state.lang === "en" ? "FMC objects" : "FMC objekty") : (objectType === "network-family" ? "Network objekty" : objectTypeLabel(objectType));
     const localCount = result.local_only + result.local_modified;
     notify(state.lang === "en"
